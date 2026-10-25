@@ -7,15 +7,15 @@ pip install -q speedtest-cli
 speedtest-cli --simple
 echo "=============================="
 
-# 1. Faster APT mirror & non-interactive install (Added ffmpeg for audio/video processing)
+# 1. Background APT install (ffmpeg, tmux, aria2)
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq tmux aria2 ffmpeg &
 APT_PID=$!
 
-# 2. Git Clone parallelly (shallow depth)
+# 2. Git Clone (Shallow clone 1-2 sec leta hai, ise synchronously run karenge taaki directory conflict na ho)
 if [ ! -d "LTX-2" ]; then
-  git clone --depth 1 https://github.com/Lightricks/LTX-2.git &
-  GIT_PID=$!
+  echo "Cloning LTX-2 repo..."
+  git clone --depth 1 https://github.com/Lightricks/LTX-2.git
 fi
 
 # 3. Enable HF Transfer (Rust-based multi-threaded max-bandwidth download engine)
@@ -36,11 +36,8 @@ hf download Lightricks/LTX-2.5 \
   --local-dir LTX-2/models/ltx-2.5 &
 DOWNLOAD_PID=$!
 
-# 5. Wait for apt and git clone to finish
+# 5. Wait for apt packages
 wait $APT_PID
-if [ -n "$GIT_PID" ]; then
-  wait $GIT_PID
-fi
 
 # --- Move server.py into LTX-2 folder ---
 if [ -f "server.py" ]; then
@@ -48,18 +45,17 @@ if [ -f "server.py" ]; then
   mv server.py LTX-2/
 fi
 
-# 6. uv sync using maximum available CPU threads
+# 6. Set up Python environment & dependencies inside LTX-2
 cd LTX-2
 uv sync --compile-bytecode
-
-# Install server requirements inside virtual environment
-uv pip install fastapi uvicorn python-multipart
+.venv/bin/pip install fastapi uvicorn python-multipart
 
 # 7. Wait for models download to complete
 wait $DOWNLOAD_PID
 
-source .venv/bin/activate
-echo "Setup finished at max speed!"
+echo "=========================================="
+echo " Setup complete! Starting FastAPI Server..."
+echo "=========================================="
 
-# Optional: Server start karne ke liye (uncomment kar sakte hain)
-uvicorn server:app --host 0.0.0.0 --port 8000
+# 8. Start FastAPI Server (Keep container running)
+exec .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000
