@@ -25,7 +25,7 @@ from ltx_pipelines.utils.types import ImageConditioningInput, ImageReplace
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_core.model.video_vae import get_video_chunks_number
 
-app = FastAPI(title="LTX-2.5 A2V Production Server (H100 Optimized)")
+app = FastAPI(title="LTX-2.5 A2V Master Production Server")
 
 print("⏳ Initializing A2V Two-Stage Models directly into H100 80GB VRAM...")
 
@@ -37,7 +37,7 @@ model_paths = ModelPaths.from_split(
     audio_vae_path=f"{MODEL_BASE}/vae/ltx-2.5-audio-vae-bf16.safetensors",
 )
 
-# H100 SXM5 80GB ke liye Offloading = NONE (Zero PCIe Swapping, 100% In-VRAM)
+# Zero Offloading: Complete pipeline locked in HBM3 VRAM for maximum speed
 offload_choice = getattr(OffloadMode, "NONE", None)
 
 pipe = A2VidPipelineTwoStage(
@@ -49,7 +49,7 @@ pipe = A2VidPipelineTwoStage(
     offload_mode=offload_choice,
 )
 
-print(f"🚀 Pipeline loaded into HBM3 VRAM! API Server Ready on port 8000.")
+print("🚀 Pipeline loaded into HBM3 VRAM! API Server Ready on port 8000.")
 
 JOBS = {}
 gpu_lock = threading.Lock()
@@ -86,13 +86,30 @@ def build_image_input(image_path: str, strength: float = 1.0):
 
     return ImageConditioningInput(**kwargs)
 
-def render_worker(job_id: str, raw_audio: str, temp_image: str, prompt: str, negative_prompt: str, seed: int, steps: int, width: int, height: int, frame_rate: float, duration: float, output_path: str):
+def render_worker(
+    job_id: str,
+    raw_audio: str,
+    temp_image: str,
+    prompt: str,
+    negative_prompt: str,
+    seed: int,
+    steps: int,
+    width: int,
+    height: int,
+    frame_rate: float,
+    duration: float,
+    cfg_scale: float,
+    modality_scale: float,
+    output_path: str
+):
     stereo_audio = f"/tmp/audio_{job_id}_stereo.wav"
+    raw_video_tmp = f"/tmp/raw_render_{job_id}.mp4"
     try:
         with gpu_lock:
             torch.cuda.empty_cache()
             JOBS[job_id]["status"] = "processing"
 
+            # 1. Audio pre-processing (Stereo 44.1kHz)
             cmd = [
                 "ffmpeg", "-y", "-i", raw_audio,
                 "-ac", "2",
@@ -101,16 +118,16 @@ def render_worker(job_id: str, raw_audio: str, temp_image: str, prompt: str, neg
             ]
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if res.returncode != 0:
-                raise RuntimeError(f"FFmpeg conversion failed: {res.stderr.decode()}")
+                raise RuntimeError(f"FFmpeg audio conversion failed: {res.stderr.decode()}")
 
             images_list = []
             if temp_image and os.path.exists(temp_image):
                 img_input = build_image_input(temp_image, strength=1.0)
                 images_list.append(img_input)
 
-            guider_params = MultiModalGuiderParams(cfg_scale=3.5, modality_scale=0.8)
+            guider_params = MultiModalGuiderParams(cfg_scale=cfg_scale, modality_scale=modality_scale)
 
-            # inference_mode + bfloat16 autocast for H100 Tensor Cores
+            # 2. Native BF16 & Inference Mode for H100
             with torch.inference_mode():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     result = pipe(
@@ -130,9 +147,9 @@ def render_worker(job_id: str, raw_audio: str, temp_image: str, prompt: str, neg
                     )
 
                 if hasattr(result, "save"):
-                    result.save(output_path)
+                    result.save(raw_video_tmp)
                 elif hasattr(result, "save_video"):
-                    result.save_video(output_path)
+                    result.save_video(raw_video_tmp)
                 else:
                     chunks_num = 1
                     try:
@@ -144,9 +161,20 @@ def render_worker(job_id: str, raw_audio: str, temp_image: str, prompt: str, neg
                         video=result.video,
                         fps=frame_rate,
                         audio=getattr(result, "audio", None),
-                        output_path=output_path,
+                        output_path=raw_video_tmp,
                         video_chunks_number=chunks_num,
                     )
+
+            # 3. Fast Lossless Remux (CRF 16 + Fast preset for zero block artifacts)
+            lossless_cmd = [
+                "ffmpeg", "-y", "-i", raw_video_tmp,
+                "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                output_path
+            ]
+            remux_res = subprocess.run(lossless_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if remux_res.returncode != 0:
+                shutil.copyfile(raw_video_tmp, output_path)
 
             JOBS[job_id]["status"] = "completed"
             JOBS[job_id]["output_path"] = output_path
@@ -156,7 +184,7 @@ def render_worker(job_id: str, raw_audio: str, temp_image: str, prompt: str, neg
         JOBS[job_id]["error"] = str(e)
     finally:
         torch.cuda.empty_cache()
-        for f in (raw_audio, stereo_audio, temp_image):
+        for f in (raw_audio, stereo_audio, temp_image, raw_video_tmp):
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
@@ -189,7 +217,9 @@ async def generate(
     height: int = Form(1088),
     width: int = Form(1920),
     frame_rate: float = Form(24.0),
-    duration: float = Form(None),
+    duration: float = Form(4.0),
+    cfg_scale: float = Form(3.0),
+    modality_scale: float = Form(0.6),
     output_path: str = Form(None)
 ):
     timestamp = int(time.time())
@@ -219,7 +249,7 @@ async def generate(
 
     background_tasks.add_task(
         render_worker, job_id, raw_audio, temp_image, prompt, negative_prompt,
-        seed, steps, width, height, frame_rate, duration, output_path
+        seed, steps, width, height, frame_rate, duration, cfg_scale, modality_scale, output_path
     )
 
     return {
