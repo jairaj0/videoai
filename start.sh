@@ -12,7 +12,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq tmux aria2 ffmpeg &
 APT_PID=$!
 
-# 2. Git Clone (Shallow clone 1-2 sec leta hai, ise synchronously run karenge taaki directory conflict na ho)
+# 2. Git Clone (Shallow clone 1-2 sec leta hai)
 if [ ! -d "LTX-2" ]; then
   echo "Cloning LTX-2 repo..."
   git clone --depth 1 https://github.com/Lightricks/LTX-2.git
@@ -22,7 +22,7 @@ fi
 export HF_HUB_ENABLE_HF_TRANSFER=1
 pip install -q -U hf_transfer huggingface_hub
 
-# 4. Background Model Download (Parallel multi-connection saturating network)
+# 4. Background Model Download
 mkdir -p LTX-2/models/ltx-2.5
 
 hf download Lightricks/LTX-2.5 \
@@ -48,7 +48,7 @@ fi
 # 6. Set up Python environment & dependencies inside LTX-2
 cd LTX-2
 uv sync --compile-bytecode
-.venv/bin/pip install fastapi uvicorn python-multipart
+uv pip install fastapi uvicorn python-multipart
 
 # 7. Wait for models download to complete
 wait $DOWNLOAD_PID
@@ -57,5 +57,5 @@ echo "=========================================="
 echo " Setup complete! Starting FastAPI Server..."
 echo "=========================================="
 
-# 8. Start FastAPI Server (Keep container running)
+# 8. Start FastAPI Server
 exec .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000
