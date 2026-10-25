@@ -6,13 +6,18 @@ import subprocess
 import threading
 import torch
 
+# --- Hopper Architecture (H100) Max-Performance Flags ---
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
+
 if not hasattr(torch.compiler, "nested_compile_region"):
     torch.compiler.nested_compile_region = lambda fn: fn
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage, OffloadMode
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_core.components.guiders import MultiModalGuiderParams
@@ -20,9 +25,9 @@ from ltx_pipelines.utils.types import ImageConditioningInput, ImageReplace
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_core.model.video_vae import get_video_chunks_number
 
-app = FastAPI(title="LTX-2.5 A2V Production Server")
+app = FastAPI(title="LTX-2.5 A2V Production Server (H100 Optimized)")
 
-print("⏳ Initializing A2V Two-Stage Models...")
+print("⏳ Initializing A2V Two-Stage Models directly into H100 80GB VRAM...")
 
 MODEL_BASE = "models/ltx-2.5"
 model_paths = ModelPaths.from_split(
@@ -32,7 +37,8 @@ model_paths = ModelPaths.from_split(
     audio_vae_path=f"{MODEL_BASE}/vae/ltx-2.5-audio-vae-bf16.safetensors",
 )
 
-offload_choice = getattr(OffloadMode, "MODEL", None) or getattr(OffloadMode, "CPU", None) or list(OffloadMode)[0]
+# H100 SXM5 80GB ke liye Offloading = NONE (Zero PCIe Swapping, 100% In-VRAM)
+offload_choice = getattr(OffloadMode, "NONE", None)
 
 pipe = A2VidPipelineTwoStage(
     model_paths=model_paths,
@@ -43,7 +49,7 @@ pipe = A2VidPipelineTwoStage(
     offload_mode=offload_choice,
 )
 
-print(f"🚀 Pipeline loaded! API Server Ready on port 8000.")
+print(f"🚀 Pipeline loaded into HBM3 VRAM! API Server Ready on port 8000.")
 
 JOBS = {}
 gpu_lock = threading.Lock()
@@ -104,22 +110,24 @@ def render_worker(job_id: str, raw_audio: str, temp_image: str, prompt: str, neg
 
             guider_params = MultiModalGuiderParams(cfg_scale=3.5, modality_scale=0.8)
 
-            with torch.no_grad():
-                result = pipe(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    seed=seed,
-                    height=height,
-                    width=width,
-                    num_frames=None,
-                    frame_rate=frame_rate,
-                    num_inference_steps=steps,
-                    video_guider_params=guider_params,
-                    images=images_list,
-                    audio_path=stereo_audio,
-                    audio_start_time=0.0,
-                    audio_max_duration=duration,
-                )
+            # inference_mode + bfloat16 autocast for H100 Tensor Cores
+            with torch.inference_mode():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    result = pipe(
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        seed=seed,
+                        height=height,
+                        width=width,
+                        num_frames=None,
+                        frame_rate=frame_rate,
+                        num_inference_steps=steps,
+                        video_guider_params=guider_params,
+                        images=images_list,
+                        audio_path=stereo_audio,
+                        audio_start_time=0.0,
+                        audio_max_duration=duration,
+                    )
 
                 if hasattr(result, "save"):
                     result.save(output_path)
@@ -154,6 +162,10 @@ def render_worker(job_id: str, raw_audio: str, temp_image: str, prompt: str, neg
                     os.remove(f)
                 except OSError:
                     pass
+
+@app.get("/")
+def index():
+    return RedirectResponse(url="/docs")
 
 @app.get("/health")
 def health():
