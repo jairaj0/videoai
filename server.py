@@ -25,9 +25,9 @@ from ltx_pipelines.utils.types import ImageConditioningInput, ImageReplace
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_core.model.video_vae import get_video_chunks_number
 
-app = FastAPI(title="LTX-2.5 A2V Master Production Server")
+app = FastAPI(title="LTX-2.5 Multi-Modal Production Server (T2V / I2V / A2V)")
 
-print("⏳ Initializing A2V Two-Stage Models directly into H100 80GB VRAM...")
+print("⏳ Initializing Models into H100 80GB VRAM...")
 
 MODEL_BASE = "models/ltx-2.5"
 model_paths = ModelPaths.from_split(
@@ -37,7 +37,6 @@ model_paths = ModelPaths.from_split(
     audio_vae_path=f"{MODEL_BASE}/vae/ltx-2.5-audio-vae-bf16.safetensors",
 )
 
-# Zero Offloading: Complete pipeline locked in HBM3 VRAM for maximum speed
 offload_choice = getattr(OffloadMode, "NONE", None)
 
 pipe = A2VidPipelineTwoStage(
@@ -49,7 +48,7 @@ pipe = A2VidPipelineTwoStage(
     offload_mode=offload_choice,
 )
 
-print("🚀 Pipeline loaded into HBM3 VRAM! API Server Ready on port 8000.")
+print("🚀 Pipeline loaded! API Server Ready on port 8000.")
 
 JOBS = {}
 gpu_lock = threading.Lock()
@@ -89,6 +88,7 @@ def build_image_input(image_path: str, strength: float = 1.0):
 def render_worker(
     job_id: str,
     raw_audio: str,
+    has_real_audio: bool,
     temp_image: str,
     prompt: str,
     negative_prompt: str,
@@ -109,25 +109,30 @@ def render_worker(
             torch.cuda.empty_cache()
             JOBS[job_id]["status"] = "processing"
 
-            # 1. Audio pre-processing (Stereo 44.1kHz)
-            cmd = [
-                "ffmpeg", "-y", "-i", raw_audio,
-                "-ac", "2",
-                "-ar", "44100",
-                stereo_audio
-            ]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if res.returncode != 0:
-                raise RuntimeError(f"FFmpeg audio conversion failed: {res.stderr.decode()}")
+            # 1. Audio handling (Real vs Silent dummy fallback)
+            if has_real_audio and raw_audio and os.path.exists(raw_audio):
+                cmd = [
+                    "ffmpeg", "-y", "-i", raw_audio,
+                    "-ac", "2", "-ar", "44100", stereo_audio
+                ]
+            else:
+                # Agar user ne audio nahi di (Pure T2V / I2V mode) -> 44.1kHz silent wave generate karein
+                cmd = [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+                    "-t", str(duration), stereo_audio
+                ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
             images_list = []
             if temp_image and os.path.exists(temp_image):
                 img_input = build_image_input(temp_image, strength=1.0)
                 images_list.append(img_input)
 
-            guider_params = MultiModalGuiderParams(cfg_scale=cfg_scale, modality_scale=modality_scale)
+            # Agar real audio nahi hai toh audio conditioning influence (modality_scale) zero/minimum rakhein
+            effective_modality = modality_scale if has_real_audio else 0.0
+            guider_params = MultiModalGuiderParams(cfg_scale=cfg_scale, modality_scale=effective_modality)
 
-            # 2. Native BF16 & Inference Mode for H100
+            # 2. Native Inference
             with torch.inference_mode():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     result = pipe(
@@ -146,32 +151,36 @@ def render_worker(
                         audio_max_duration=duration,
                     )
 
-                if hasattr(result, "save"):
-                    result.save(raw_video_tmp)
-                elif hasattr(result, "save_video"):
-                    result.save_video(raw_video_tmp)
-                else:
-                    chunks_num = 1
-                    try:
-                        chunks_num = get_video_chunks_number(result.num_frames, result.tiling_config)
-                    except Exception:
-                        pass
+                chunks_num = 1
+                try:
+                    chunks_num = get_video_chunks_number(result.num_frames, result.tiling_config)
+                except Exception:
+                    pass
 
-                    encode_video(
-                        video=result.video,
-                        fps=frame_rate,
-                        audio=getattr(result, "audio", None),
-                        output_path=raw_video_tmp,
-                        video_chunks_number=chunks_num,
-                    )
+                encode_video(
+                    video=result.video,
+                    fps=frame_rate,
+                    audio=getattr(result, "audio", None) if has_real_audio else None,
+                    output_path=raw_video_tmp,
+                    video_chunks_number=chunks_num,
+                )
 
-            # 3. Fast Lossless Remux (CRF 16 + Fast preset for zero block artifacts)
-            lossless_cmd = [
-                "ffmpeg", "-y", "-i", raw_video_tmp,
-                "-c:v", "libx264", "-crf", "16", "-preset", "fast",
-                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-                output_path
-            ]
+            # 3. Final Encode
+            if has_real_audio:
+                lossless_cmd = [
+                    "ffmpeg", "-y", "-i", raw_video_tmp,
+                    "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                    output_path
+                ]
+            else:
+                # Silent video strip for pure T2V/I2V
+                lossless_cmd = [
+                    "ffmpeg", "-y", "-i", raw_video_tmp,
+                    "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+                    "-pix_fmt", "yuv420p", "-an",
+                    output_path
+                ]
             remux_res = subprocess.run(lossless_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if remux_res.returncode != 0:
                 shutil.copyfile(raw_video_tmp, output_path)
@@ -191,10 +200,6 @@ def render_worker(
                 except OSError:
                     pass
 
-@app.get("/")
-def index():
-    return RedirectResponse(url="/docs")
-
 @app.get("/health")
 def health():
     return {
@@ -208,28 +213,32 @@ def health():
 @app.post("/generate")
 async def generate(
     background_tasks: BackgroundTasks,
-    audio: UploadFile = File(...),
-    image: UploadFile = File(None),
+    audio: UploadFile = File(None),      # <-- Optional banaya (T2V/I2V ke liye)
+    image: UploadFile = File(None),      # <-- Optional banaya (T2V ke liye)
     prompt: str = Form(...),
-    negative_prompt: str = Form("worst quality, blurry, distorted, jitter, noisy, low resolution"),
+    negative_prompt: str = Form("worst quality, blurry, distorted, jitter, low resolution"),
     seed: int = Form(42),
     steps: int = Form(16),
     height: int = Form(1088),
     width: int = Form(1920),
     frame_rate: float = Form(24.0),
-    duration: float = Form(4.0),
+    duration: float = Form(5.0),
     cfg_scale: float = Form(3.0),
     modality_scale: float = Form(0.6),
     output_path: str = Form(None)
 ):
     timestamp = int(time.time())
     job_id = f"render_{seed}_{timestamp}"
-    raw_audio = f"/tmp/raw_audio_{job_id}_{audio.filename}"
+    raw_audio = None
+    has_real_audio = False
+
+    if audio and audio.filename:
+        has_real_audio = True
+        raw_audio = f"/tmp/raw_audio_{job_id}_{audio.filename}"
+        with open(raw_audio, "wb") as buffer:
+            shutil.copyfileobj(audio.file, buffer)
+
     temp_image = None
-
-    with open(raw_audio, "wb") as buffer:
-        shutil.copyfileobj(audio.file, buffer)
-
     if image and image.filename:
         img_ext = os.path.splitext(image.filename)[1] or ".png"
         temp_image = f"/tmp/image_{job_id}{img_ext}"
@@ -248,15 +257,11 @@ async def generate(
     }
 
     background_tasks.add_task(
-        render_worker, job_id, raw_audio, temp_image, prompt, negative_prompt,
+        render_worker, job_id, raw_audio, has_real_audio, temp_image, prompt, negative_prompt,
         seed, steps, width, height, frame_rate, duration, cfg_scale, modality_scale, output_path
     )
 
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "message": "Render task queued successfully."
-    }
+    return {"job_id": job_id, "status": "queued"}
 
 @app.get("/status/{job_id}")
 def check_status(job_id: str):
@@ -267,17 +272,6 @@ def check_status(job_id: str):
 @app.get("/download/{job_id}")
 def download_video(job_id: str):
     job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job ID not found")
-    if job.get("status") != "completed":
+    if not job or job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="Job not completed yet.")
-    
-    file_path = job.get("output_path")
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Rendered file missing from disk.")
-
-    return FileResponse(
-        path=file_path,
-        media_type="video/mp4",
-        filename=os.path.basename(file_path)
-    )
+    return FileResponse(path=job["output_path"], media_type="video/mp4", filename=os.path.basename(job["output_path"]))
