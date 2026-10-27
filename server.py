@@ -54,53 +54,73 @@ print("🚀 Pipeline loaded! API Server Ready on port 8000.")
 JOBS = {}
 gpu_lock = threading.Lock()
 
+def create_binding(cls, frame_index: int):
+    """Safely instantiates ImageReplace or ImageGuide across different class signatures."""
+    sig = inspect.signature(cls.__init__)
+    params = sig.parameters
+    kwargs = {}
+    for p in params:
+        if p in ("frame_index", "frame_idx", "frame", "target_frame", "index"):
+            kwargs[p] = frame_index
+    try:
+        return cls(**kwargs)
+    except Exception:
+        try:
+            return cls(frame_index)
+        except Exception:
+            return cls()
+
+def make_img_input(file_path: str, strength: float, binding_obj):
+    """
+    Safely creates ImageConditioningInput without hardcoded keyword crashes.
+    """
+    sig = inspect.signature(ImageConditioningInput.__init__)
+    param_names = [p for p in sig.parameters.keys() if p != "self"]
+    
+    kwargs = {}
+    for p in param_names:
+        if p in ("path", "image_path", "file_path", "img_path"):
+            kwargs[p] = file_path
+        elif p == "strength":
+            kwargs[p] = strength
+        elif p in ("binding", "replace", "guide"):
+            kwargs[p] = binding_obj
+
+    if len(kwargs) == len(param_names) or "path" in kwargs or "image_path" in kwargs:
+        try:
+            return ImageConditioningInput(**kwargs)
+        except TypeError:
+            pass
+
+    # Pure positional fallback
+    try:
+        return ImageConditioningInput(file_path, strength, binding_obj)
+    except Exception:
+        return ImageConditioningInput(file_path)
+
 def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: list = None):
     """
-    Frame 0 ke liye ImageReplace aur baki Character/BG references ke liye
-    causal latent attention frame boundary par ImageGuide bind karta hai.
+    Frame 0 ke liye ImageReplace aur baki reference assets ke liye
+    causal latent attention boundaries par ImageGuide bind karta hai.
     """
     conditioning_list = []
     
-    # 1. First Frame Anchor (Canvas continuity ya base scene)
+    # 1. First Frame Anchor (Canvas continuity / Scene starting frame)
     if first_frame_path and os.path.exists(first_frame_path):
-        try:
-            conditioning_list.append(
-                ImageConditioningInput(
-                    path=first_frame_path,
-                    strength=1.0,
-                    binding=ImageReplace(frame_index=0)
-                )
-            )
-        except TypeError:
-            conditioning_list.append(
-                ImageConditioningInput(image=first_frame_path, strength=1.0, binding=ImageReplace(0))
-            )
+        binding = create_binding(ImageReplace, frame_index=0)
+        conditioning_list.append(make_img_input(first_frame_path, 1.0, binding))
 
-    # 2. Multi-Reference Assets (Characters, Background context)
+    # 2. Multi-Reference Assets (Characters, Backgrounds, Props)
     if ref_assets:
         for idx, asset_path in enumerate(ref_assets):
             if asset_path and os.path.exists(asset_path):
-                # 8-step causal frame offset
                 frame_slot = 1 + (8 * (idx + 1))
                 try:
-                    conditioning_list.append(
-                        ImageConditioningInput(
-                            path=asset_path,
-                            strength=0.85,
-                            binding=ImageGuide(frame_index=frame_slot)
-                        )
-                    )
+                    binding = create_binding(ImageGuide, frame_index=frame_slot)
                 except Exception:
-                    try:
-                        conditioning_list.append(
-                            ImageConditioningInput(
-                                path=asset_path,
-                                strength=0.85,
-                                binding=ImageReplace(frame_index=frame_slot)
-                            )
-                        )
-                    except Exception:
-                        pass
+                    binding = create_binding(ImageReplace, frame_index=frame_slot)
+                
+                conditioning_list.append(make_img_input(asset_path, 0.85, binding))
                         
     return conditioning_list
 
@@ -168,7 +188,6 @@ def render_worker(
                 except Exception:
                     pass
 
-                # LTX native audio synthesize/mix ko retain karte hue video encode karein
                 generated_audio = getattr(result, "audio", None)
                 encode_video(
                     video=result.video,
@@ -178,8 +197,7 @@ def render_worker(
                     video_chunks_number=chunks_num,
                 )
 
-            # 5. Final Lossless Web-Ready Remux (Voice + Synth SFX Audio Stream)
-            # Agar LTX generated audio return kare toh usko use karega, warna input voice integrate karega
+            # 5. Final Lossless Web-Ready Remux
             lossless_cmd = [
                 "ffmpeg", "-y", "-i", raw_video_tmp,
                 "-c:v", "libx264", "-crf", "16", "-preset", "fast",
@@ -218,9 +236,9 @@ def health():
 @app.post("/generate")
 async def generate(
     background_tasks: BackgroundTasks,
-    audio: UploadFile = File(...),                    # Aapka voice.mp3
-    first_frame: UploadFile = File(None),            # Scene ka initial canvas ya prev frame
-    ref_images: List[UploadFile] = File([]),         # Multiple character/bg assets
+    audio: UploadFile = File(...),
+    first_frame: UploadFile = File(None),
+    ref_images: List[UploadFile] = File([]),
     prompt: str = Form(...),
     negative_prompt: str = Form("worst quality, blurry, distorted, jitter, low resolution"),
     seed: int = Form(42),
@@ -241,7 +259,7 @@ async def generate(
     with open(raw_audio, "wb") as buffer:
         shutil.copyfileobj(audio.file, buffer)
 
-    # 2. Save First Frame if given
+    # 2. Save First Frame if provided
     first_frame_path = None
     if first_frame and first_frame.filename:
         ext = os.path.splitext(first_frame.filename)[1] or ".png"
