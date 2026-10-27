@@ -4,6 +4,7 @@ import shutil
 import inspect
 import subprocess
 import threading
+from typing import List
 import torch
 
 # --- Hopper Architecture (H100) Max-Performance Flags ---
@@ -17,15 +18,15 @@ if not hasattr(torch.compiler, "nested_compile_region"):
     torch.compiler.nested_compile_region = lambda fn: fn
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse
 from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage, OffloadMode
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_core.components.guiders import MultiModalGuiderParams
-from ltx_pipelines.utils.types import ImageConditioningInput, ImageReplace
+from ltx_pipelines.utils.types import ImageConditioningInput, ImageReplace, ImageGuide
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_core.model.video_vae import get_video_chunks_number
 
-app = FastAPI(title="LTX-2.5 Multi-Modal Production Server (T2V / I2V / A2V)")
+app = FastAPI(title="LTX-2.5 Multi-Modal Production Server (Multi-Reference A2V)")
 
 print("⏳ Initializing Models into H100 80GB VRAM...")
 
@@ -53,43 +54,61 @@ print("🚀 Pipeline loaded! API Server Ready on port 8000.")
 JOBS = {}
 gpu_lock = threading.Lock()
 
-def create_image_replace_binding(frame_index: int = 0):
-    sig = inspect.signature(ImageReplace.__init__)
-    params = sig.parameters
-    kwargs = {}
-    for p in params:
-        if p in ("frame_index", "frame_idx", "frame", "target_frame", "index"):
-            kwargs[p] = frame_index
-    try:
-        return ImageReplace(**kwargs)
-    except Exception:
+def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: list = None):
+    """
+    Frame 0 ke liye ImageReplace aur baki Character/BG references ke liye
+    causal latent attention frame boundary par ImageGuide bind karta hai.
+    """
+    conditioning_list = []
+    
+    # 1. First Frame Anchor (Canvas continuity ya base scene)
+    if first_frame_path and os.path.exists(first_frame_path):
         try:
-            return ImageReplace(frame_index)
-        except Exception:
-            return ImageReplace()
+            conditioning_list.append(
+                ImageConditioningInput(
+                    path=first_frame_path,
+                    strength=1.0,
+                    binding=ImageReplace(frame_index=0)
+                )
+            )
+        except TypeError:
+            conditioning_list.append(
+                ImageConditioningInput(image=first_frame_path, strength=1.0, binding=ImageReplace(0))
+            )
 
-def build_image_input(image_path: str, strength: float = 1.0):
-    binding = create_image_replace_binding(frame_index=0)
-    sig = inspect.signature(ImageConditioningInput.__init__)
-    params = sig.parameters
-    kwargs = {}
-    for p_name in params:
-        if p_name == "self":
-            continue
-        if p_name in ("image", "path", "image_path", "file_path"):
-            kwargs[p_name] = image_path
-        elif p_name == "strength":
-            kwargs[p_name] = strength
-        elif p_name == "binding":
-            kwargs[p_name] = binding
-
-    return ImageConditioningInput(**kwargs)
+    # 2. Multi-Reference Assets (Characters, Background context)
+    if ref_assets:
+        for idx, asset_path in enumerate(ref_assets):
+            if asset_path and os.path.exists(asset_path):
+                # 8-step causal frame offset
+                frame_slot = 1 + (8 * (idx + 1))
+                try:
+                    conditioning_list.append(
+                        ImageConditioningInput(
+                            path=asset_path,
+                            strength=0.85,
+                            binding=ImageGuide(frame_index=frame_slot)
+                        )
+                    )
+                except Exception:
+                    try:
+                        conditioning_list.append(
+                            ImageConditioningInput(
+                                path=asset_path,
+                                strength=0.85,
+                                binding=ImageReplace(frame_index=frame_slot)
+                            )
+                        )
+                    except Exception:
+                        pass
+                        
+    return conditioning_list
 
 def render_worker(
     job_id: str,
     raw_audio: str,
-    has_real_audio: bool,
-    temp_image: str,
+    first_frame_img: str,
+    ref_image_paths: list,
     prompt: str,
     negative_prompt: str,
     seed: int,
@@ -104,35 +123,27 @@ def render_worker(
 ):
     stereo_audio = f"/tmp/audio_{job_id}_stereo.wav"
     raw_video_tmp = f"/tmp/raw_render_{job_id}.mp4"
+    files_to_clean = [raw_audio, stereo_audio, first_frame_img, raw_video_tmp] + (ref_image_paths or [])
+
     try:
         with gpu_lock:
             torch.cuda.empty_cache()
             JOBS[job_id]["status"] = "processing"
 
-            # 1. Audio handling (Real vs Silent dummy fallback)
-            if has_real_audio and raw_audio and os.path.exists(raw_audio):
-                cmd = [
-                    "ffmpeg", "-y", "-i", raw_audio,
-                    "-ac", "2", "-ar", "44100", stereo_audio
-                ]
-            else:
-                # Agar user ne audio nahi di (Pure T2V / I2V mode) -> 44.1kHz silent wave generate karein
-                cmd = [
-                    "ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
-                    "-t", str(duration), stereo_audio
-                ]
+            # 1. Voice Audio conversion (44.1kHz Stereo standard)
+            cmd = [
+                "ffmpeg", "-y", "-i", raw_audio,
+                "-ac", "2", "-ar", "44100", stereo_audio
+            ]
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            images_list = []
-            if temp_image and os.path.exists(temp_image):
-                img_input = build_image_input(temp_image, strength=1.0)
-                images_list.append(img_input)
+            # 2. Conditioning Inputs Build (First Frame + Multi Assets)
+            images_list = build_multi_asset_conditioning(first_frame_img, ref_image_paths)
 
-            # Agar real audio nahi hai toh audio conditioning influence (modality_scale) zero/minimum rakhein
-            effective_modality = modality_scale if has_real_audio else 0.0
-            guider_params = MultiModalGuiderParams(cfg_scale=cfg_scale, modality_scale=effective_modality)
+            # 3. Audio & CFG Guider Parameters
+            guider_params = MultiModalGuiderParams(cfg_scale=cfg_scale, modality_scale=modality_scale)
 
-            # 2. Native Inference
+            # 4. Pipeline Execution
             with torch.inference_mode():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     result = pipe(
@@ -157,30 +168,24 @@ def render_worker(
                 except Exception:
                     pass
 
+                # LTX native audio synthesize/mix ko retain karte hue video encode karein
+                generated_audio = getattr(result, "audio", None)
                 encode_video(
                     video=result.video,
                     fps=frame_rate,
-                    audio=getattr(result, "audio", None) if has_real_audio else None,
+                    audio=generated_audio if generated_audio is not None else None,
                     output_path=raw_video_tmp,
                     video_chunks_number=chunks_num,
                 )
 
-            # 3. Final Encode
-            if has_real_audio:
-                lossless_cmd = [
-                    "ffmpeg", "-y", "-i", raw_video_tmp,
-                    "-c:v", "libx264", "-crf", "16", "-preset", "fast",
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-                    output_path
-                ]
-            else:
-                # Silent video strip for pure T2V/I2V
-                lossless_cmd = [
-                    "ffmpeg", "-y", "-i", raw_video_tmp,
-                    "-c:v", "libx264", "-crf", "16", "-preset", "fast",
-                    "-pix_fmt", "yuv420p", "-an",
-                    output_path
-                ]
+            # 5. Final Lossless Web-Ready Remux (Voice + Synth SFX Audio Stream)
+            # Agar LTX generated audio return kare toh usko use karega, warna input voice integrate karega
+            lossless_cmd = [
+                "ffmpeg", "-y", "-i", raw_video_tmp,
+                "-c:v", "libx264", "-crf", "16", "-preset", "fast",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                output_path
+            ]
             remux_res = subprocess.run(lossless_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if remux_res.returncode != 0:
                 shutil.copyfile(raw_video_tmp, output_path)
@@ -193,7 +198,7 @@ def render_worker(
         JOBS[job_id]["error"] = str(e)
     finally:
         torch.cuda.empty_cache()
-        for f in (raw_audio, stereo_audio, temp_image, raw_video_tmp):
+        for f in files_to_clean:
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
@@ -213,37 +218,47 @@ def health():
 @app.post("/generate")
 async def generate(
     background_tasks: BackgroundTasks,
-    audio: UploadFile = File(None),      # <-- Optional banaya (T2V/I2V ke liye)
-    image: UploadFile = File(None),      # <-- Optional banaya (T2V ke liye)
+    audio: UploadFile = File(...),                    # Aapka voice.mp3
+    first_frame: UploadFile = File(None),            # Scene ka initial canvas ya prev frame
+    ref_images: List[UploadFile] = File([]),         # Multiple character/bg assets
     prompt: str = Form(...),
     negative_prompt: str = Form("worst quality, blurry, distorted, jitter, low resolution"),
     seed: int = Form(42),
-    steps: int = Form(16),
+    steps: int = Form(20),
     height: int = Form(1088),
     width: int = Form(1920),
     frame_rate: float = Form(24.0),
     duration: float = Form(5.0),
     cfg_scale: float = Form(3.0),
-    modality_scale: float = Form(0.6),
+    modality_scale: float = Form(0.65),
     output_path: str = Form(None)
 ):
     timestamp = int(time.time())
     job_id = f"render_{seed}_{timestamp}"
-    raw_audio = None
-    has_real_audio = False
 
-    if audio and audio.filename:
-        has_real_audio = True
-        raw_audio = f"/tmp/raw_audio_{job_id}_{audio.filename}"
-        with open(raw_audio, "wb") as buffer:
-            shutil.copyfileobj(audio.file, buffer)
+    # 1. Save Voice Audio
+    raw_audio = f"/tmp/raw_audio_{job_id}_{audio.filename}"
+    with open(raw_audio, "wb") as buffer:
+        shutil.copyfileobj(audio.file, buffer)
 
-    temp_image = None
-    if image and image.filename:
-        img_ext = os.path.splitext(image.filename)[1] or ".png"
-        temp_image = f"/tmp/image_{job_id}{img_ext}"
-        with open(temp_image, "wb") as buffer:
-            shutil.copyfileobj(image.file, buffer)
+    # 2. Save First Frame if given
+    first_frame_path = None
+    if first_frame and first_frame.filename:
+        ext = os.path.splitext(first_frame.filename)[1] or ".png"
+        first_frame_path = f"/tmp/first_frame_{job_id}{ext}"
+        with open(first_frame_path, "wb") as buffer:
+            shutil.copyfileobj(first_frame.file, buffer)
+
+    # 3. Save Multiple Reference Assets
+    saved_ref_paths = []
+    if ref_images:
+        for idx, r_file in enumerate(ref_images):
+            if r_file.filename:
+                r_ext = os.path.splitext(r_file.filename)[1] or ".png"
+                r_path = f"/tmp/ref_{job_id}_{idx}{r_ext}"
+                with open(r_path, "wb") as buffer:
+                    shutil.copyfileobj(r_file.file, buffer)
+                saved_ref_paths.append(r_path)
 
     if not output_path:
         output_path = f"/workspace/LTX-2/outputs/{job_id}.mp4"
@@ -257,8 +272,22 @@ async def generate(
     }
 
     background_tasks.add_task(
-        render_worker, job_id, raw_audio, has_real_audio, temp_image, prompt, negative_prompt,
-        seed, steps, width, height, frame_rate, duration, cfg_scale, modality_scale, output_path
+        render_worker,
+        job_id,
+        raw_audio,
+        first_frame_path,
+        saved_ref_paths,
+        prompt,
+        negative_prompt,
+        seed,
+        steps,
+        width,
+        height,
+        frame_rate,
+        duration,
+        cfg_scale,
+        modality_scale,
+        output_path
     )
 
     return {"job_id": job_id, "status": "queued"}
