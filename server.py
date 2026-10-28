@@ -1,14 +1,12 @@
 import os
 import time
 import shutil
-import inspect
 import subprocess
 import threading
 from typing import List
-from types import SimpleNamespace
 import torch
 
-# --- Hopper/Ada Architecture Max-Performance Flags ---
+# --- GPU Acceleration Flags ---
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -24,11 +22,10 @@ from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage, OffloadMode
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_core.components.guiders import MultiModalGuiderParams
 from ltx_pipelines.utils.types import ImageConditioningInput, ImageReplace, ImageGuide
-from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_core.model.video_vae import get_video_chunks_number
 
-app = FastAPI(title="LTX-2.5 Multi-Modal Production Server (LoRA-Enabled)")
+app = FastAPI(title="LTX-2.5 Video Pipeline Server")
 
 print("⏳ Initializing Models into VRAM...")
 
@@ -42,35 +39,10 @@ model_paths = ModelPaths.from_split(
 
 offload_choice = getattr(OffloadMode, "NONE", None)
 
-# --- LoRA Fix: Pass LoraPathStrengthAndSDOps with .strength and .path ---
-distilled_lora_list = []
-distilled_lora_path = f"{MODEL_BASE}/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
-
-if os.path.exists(distilled_lora_path):
-    print(f"✅ Loading Distilled LoRA: {distilled_lora_path}")
-    try:
-        lora_obj = LoraPathStrengthAndSDOps(path=distilled_lora_path, strength=1.0)
-    except Exception:
-        try:
-            lora_obj = LoraPathStrengthAndSDOps(distilled_lora_path, 1.0)
-        except Exception:
-            lora_obj = SimpleNamespace(path=distilled_lora_path, strength=1.0, sd_ops=SimpleNamespace(name="default"))
-    
-    # Defensive guarantee for pipeline weight_tracker
-    if not hasattr(lora_obj, "strength"):
-        setattr(lora_obj, "strength", 1.0)
-    if not hasattr(lora_obj, "path"):
-        setattr(lora_obj, "path", distilled_lora_path)
-    if not hasattr(lora_obj, "sd_ops"):
-        setattr(lora_obj, "sd_ops", SimpleNamespace(name="default"))
-
-    distilled_lora_list.append(lora_obj)
-else:
-    print(f"⚠️ Notice: LoRA not found at {distilled_lora_path}, running base weights.")
-
+# Base 22B model already distilled hai, isliye custom LoRA inject karne ki zaroorat nahi hai
 pipe = A2VidPipelineTwoStage(
     model_paths=model_paths,
-    distilled_lora=distilled_lora_list,
+    distilled_lora=[],
     spatial_upsampler_path=f"{MODEL_BASE}/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
     loras=[],
     device=torch.device("cuda:0"),
@@ -82,12 +54,6 @@ print("🚀 Pipeline loaded! API Server Ready on port 8000.")
 JOBS = {}
 gpu_lock = threading.Lock()
 
-def make_img_input(file_path: str, strength: float, binding_obj):
-    try:
-        return ImageConditioningInput(path=str(file_path), strength=float(strength), binding=binding_obj)
-    except Exception:
-        return ImageConditioningInput(str(file_path), float(strength), binding_obj)
-
 def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: list = None):
     conditioning_list = []
     
@@ -96,25 +62,15 @@ def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: lis
         start_canvas = ref_assets[0]
 
     if start_canvas and os.path.exists(start_canvas):
-        try:
-            binding = ImageReplace(0)
-        except Exception:
-            binding = ImageReplace(frame_index=0)
-            
-        inp = make_img_input(start_canvas, 1.0, binding)
-        conditioning_list.append(inp)
+        binding = ImageReplace(frame_index=0)
+        conditioning_list.append(ImageConditioningInput(path=str(start_canvas), strength=1.0, binding=binding))
 
     if ref_assets:
         for asset_path in ref_assets:
             if asset_path and os.path.exists(asset_path) and asset_path != start_canvas:
                 try:
-                    try:
-                        binding = ImageGuide(0)
-                    except Exception:
-                        binding = ImageGuide(frame_index=0)
-                    
-                    inp = make_img_input(asset_path, 0.70, binding)
-                    conditioning_list.append(inp)
+                    binding = ImageGuide(frame_index=0)
+                    conditioning_list.append(ImageConditioningInput(path=str(asset_path), strength=0.70, binding=binding))
                 except Exception:
                     pass
                         
@@ -220,8 +176,7 @@ def health():
         "device": torch.cuda.get_device_name(0),
         "vram_allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2),
         "vram_reserved_gb": round(torch.cuda.memory_reserved(0) / 1e9, 2),
-        "active_jobs": len(JOBS),
-        "distilled_lora_loaded": len(distilled_lora_list) > 0
+        "active_jobs": len(JOBS)
     }
 
 @app.post("/generate")
