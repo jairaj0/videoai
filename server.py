@@ -40,18 +40,16 @@ model_paths = ModelPaths.from_split(
 
 offload_choice = getattr(OffloadMode, "NONE", None)
 
-# LoRA discovery
+# Exact LoRA path verification matching repository scan
 distilled_lora_list = []
-distilled_lora_path = f"{MODEL_BASE}/loras/ltx-2.5-distilled-lora-bf16.safetensors"
+distilled_lora_path = f"{MODEL_BASE}/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
 if os.path.exists(distilled_lora_path):
-    print(f"✅ Loading Distilled LoRA: {distilled_lora_path}")
+    print(f"✅ Loading Verified Distilled LoRA: {distilled_lora_path}")
     distilled_lora_list.append(distilled_lora_path)
+else:
+    print(f"⚠️ Notice: LoRA not found at {distilled_lora_path}, running base weights.")
 
 loras_list = []
-ic_lora_path = f"{MODEL_BASE}/loras/ltx-2.5-ic-lora-bf16.safetensors"
-if os.path.exists(ic_lora_path):
-    print(f"✅ Loading IC-LoRA for Reference Conditioning: {ic_lora_path}")
-    loras_list.append(ic_lora_path)
 
 pipe = A2VidPipelineTwoStage(
     model_paths=model_paths,
@@ -62,7 +60,7 @@ pipe = A2VidPipelineTwoStage(
     offload_mode=offload_choice,
 )
 
-print("🚀 Pipeline loaded with LoRAs! API Server Ready on port 8000.")
+print("🚀 Pipeline loaded with verified LoRA! API Server Ready on port 8000.")
 
 JOBS = {}
 gpu_lock = threading.Lock()
@@ -112,7 +110,6 @@ def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: lis
     """
     conditioning_list = []
     
-    # 1. Starting Canvas / First Frame
     start_canvas = first_frame_path
     if not start_canvas and ref_assets and len(ref_assets) > 0:
         start_canvas = ref_assets[0]
@@ -121,12 +118,10 @@ def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: lis
         binding = create_binding(ImageReplace, frame_index=0)
         conditioning_list.append(make_img_input(start_canvas, 1.0, binding))
 
-    # 2. Reference Guidance (Agar IC-LoRA guide support ho toh weak guiding)
     if ref_assets:
-        for idx, asset_path in enumerate(ref_assets):
+        for asset_path in ref_assets:
             if asset_path and os.path.exists(asset_path) and asset_path != start_canvas:
                 try:
-                    # Guiding context without overwriting video pixels
                     binding = create_binding(ImageGuide, frame_index=0)
                     conditioning_list.append(make_img_input(asset_path, 0.70, binding))
                 except Exception:
@@ -235,8 +230,7 @@ def health():
         "vram_allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2),
         "vram_reserved_gb": round(torch.cuda.memory_reserved(0) / 1e9, 2),
         "active_jobs": len(JOBS),
-        "distilled_lora_loaded": len(distilled_lora_list) > 0,
-        "ic_lora_loaded": len(loras_list) > 0
+        "distilled_lora_loaded": len(distilled_lora_list) > 0
     }
 
 @app.post("/generate")
