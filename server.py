@@ -5,6 +5,7 @@ import inspect
 import subprocess
 import threading
 from typing import List
+from types import SimpleNamespace
 import torch
 
 # --- Hopper/Ada Architecture Max-Performance Flags ---
@@ -23,6 +24,7 @@ from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage, OffloadMode
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_core.components.guiders import MultiModalGuiderParams
 from ltx_pipelines.utils.types import ImageConditioningInput, ImageReplace, ImageGuide
+from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_core.model.video_vae import get_video_chunks_number
 
@@ -40,11 +42,31 @@ model_paths = ModelPaths.from_split(
 
 offload_choice = getattr(OffloadMode, "NONE", None)
 
+# --- LoRA Fix: Pass LoraPathStrengthAndSDOps with .strength and .path ---
 distilled_lora_list = []
 distilled_lora_path = f"{MODEL_BASE}/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
+
 if os.path.exists(distilled_lora_path):
     print(f"✅ Loading Distilled LoRA: {distilled_lora_path}")
-    distilled_lora_list.append(distilled_lora_path)
+    try:
+        lora_obj = LoraPathStrengthAndSDOps(path=distilled_lora_path, strength=1.0)
+    except Exception:
+        try:
+            lora_obj = LoraPathStrengthAndSDOps(distilled_lora_path, 1.0)
+        except Exception:
+            lora_obj = SimpleNamespace(path=distilled_lora_path, strength=1.0, sd_ops=SimpleNamespace(name="default"))
+    
+    # Defensive guarantee for pipeline weight_tracker
+    if not hasattr(lora_obj, "strength"):
+        setattr(lora_obj, "strength", 1.0)
+    if not hasattr(lora_obj, "path"):
+        setattr(lora_obj, "path", distilled_lora_path)
+    if not hasattr(lora_obj, "sd_ops"):
+        setattr(lora_obj, "sd_ops", SimpleNamespace(name="default"))
+
+    distilled_lora_list.append(lora_obj)
+else:
+    print(f"⚠️ Notice: LoRA not found at {distilled_lora_path}, running base weights.")
 
 pipe = A2VidPipelineTwoStage(
     model_paths=model_paths,
@@ -61,53 +83,12 @@ JOBS = {}
 gpu_lock = threading.Lock()
 
 def make_img_input(file_path: str, strength: float, binding_obj):
-    """
-    Constructs ImageConditioningInput without keyword or argument position mismatch.
-    """
-    sig = inspect.signature(ImageConditioningInput.__init__)
-    params = [p for p in sig.parameters.keys() if p != "self"]
-    
-    # 1. Keyword mapping based on inspected parameter names
-    kwargs = {}
-    for p in params:
-        if p in ("path", "image_path", "file_path", "img_path"):
-            kwargs[p] = str(file_path)
-        elif p == "strength":
-            kwargs[p] = float(strength)
-        elif p in ("binding", "replace", "guide"):
-            kwargs[p] = binding_obj
-
-    if len(kwargs) == len(params) and len(params) > 0:
-        try:
-            return ImageConditioningInput(**kwargs)
-        except Exception:
-            pass
-
-    # 2. Strict positional matching: (path, strength, binding)
     try:
-        obj = ImageConditioningInput(str(file_path), float(strength), binding_obj)
-        return obj
+        return ImageConditioningInput(path=str(file_path), strength=float(strength), binding=binding_obj)
     except Exception:
-        pass
-
-    # 3. Positional fallback: (binding, strength, path)
-    try:
-        obj = ImageConditioningInput(binding_obj, float(strength), str(file_path))
-        return obj
-    except Exception:
-        pass
-
-    # 4. Attribute fallback ensuring strength is float and not string
-    obj = ImageConditioningInput(str(file_path))
-    setattr(obj, "strength", float(strength))
-    setattr(obj, "binding", binding_obj)
-    return obj
+        return ImageConditioningInput(str(file_path), float(strength), binding_obj)
 
 def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: list = None):
-    """
-    Frame 0 canvas ko ImageReplace se lock karta hai.
-    Extra reference assets ko ImageGuide context provide karta hai.
-    """
     conditioning_list = []
     
     start_canvas = first_frame_path
@@ -121,10 +102,8 @@ def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: lis
             binding = ImageReplace(frame_index=0)
             
         inp = make_img_input(start_canvas, 1.0, binding)
-        if hasattr(inp, "strength") and not isinstance(inp, str):
-            conditioning_list.append(inp)
+        conditioning_list.append(inp)
 
-    # Reference assets context guidance
     if ref_assets:
         for asset_path in ref_assets:
             if asset_path and os.path.exists(asset_path) and asset_path != start_canvas:
@@ -135,8 +114,7 @@ def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: lis
                         binding = ImageGuide(frame_index=0)
                     
                     inp = make_img_input(asset_path, 0.70, binding)
-                    if hasattr(inp, "strength") and not isinstance(inp, str):
-                        conditioning_list.append(inp)
+                    conditioning_list.append(inp)
                 except Exception:
                     pass
                         
@@ -255,7 +233,7 @@ async def generate(
     prompt: str = Form(...),
     negative_prompt: str = Form("worst quality, blurry, distorted, jitter, low resolution"),
     seed: int = Form(42),
-    steps: int = Form(20),
+    steps: int = Form(12),
     height: int = Form(512),
     width: int = Form(896),
     frame_rate: float = Form(24.0),
