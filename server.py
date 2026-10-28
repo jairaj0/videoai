@@ -78,11 +78,15 @@ def create_binding(cls, frame_index: int):
             return cls()
 
 def make_img_input(file_path: str, strength: float, binding_obj):
+    """
+    Safely creates ImageConditioningInput ensuring attributes match what the pipeline expects.
+    """
+    # 1. Check exact __init__ parameters
     sig = inspect.signature(ImageConditioningInput.__init__)
-    param_names = [p for p in sig.parameters.keys() if p != "self"]
+    params = [p for p in sig.parameters.keys() if p != "self"]
     
     kwargs = {}
-    for p in param_names:
+    for p in params:
         if p in ("path", "image_path", "file_path", "img_path"):
             kwargs[p] = file_path
         elif p == "strength":
@@ -90,16 +94,32 @@ def make_img_input(file_path: str, strength: float, binding_obj):
         elif p in ("binding", "replace", "guide"):
             kwargs[p] = binding_obj
 
-    if len(kwargs) == len(param_names) or "path" in kwargs or "image_path" in kwargs:
+    # Try instantiation with matched kwargs
+    if kwargs:
         try:
-            return ImageConditioningInput(**kwargs)
-        except TypeError:
+            obj = ImageConditioningInput(**kwargs)
+            # Ensure strength attribute exists
+            if not hasattr(obj, "strength"):
+                setattr(obj, "strength", strength)
+            if not hasattr(obj, "binding"):
+                setattr(obj, "binding", binding_obj)
+            return obj
+        except Exception:
             pass
 
+    # Positional instantiation
     try:
-        return ImageConditioningInput(file_path, strength, binding_obj)
+        obj = ImageConditioningInput(file_path, strength, binding_obj)
+        return obj
     except Exception:
-        return ImageConditioningInput(file_path)
+        try:
+            obj = ImageConditioningInput(binding_obj, strength, file_path)
+            return obj
+        except Exception:
+            obj = ImageConditioningInput(file_path)
+            setattr(obj, "strength", strength)
+            setattr(obj, "binding", binding_obj)
+            return obj
 
 def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: list = None):
     """
