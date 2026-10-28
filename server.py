@@ -7,7 +7,7 @@ import threading
 from typing import List
 import torch
 
-# --- Hopper Architecture (H100) Max-Performance Flags ---
+# --- Hopper/Ada Architecture Max-Performance Flags ---
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -28,7 +28,7 @@ from ltx_core.model.video_vae import get_video_chunks_number
 
 app = FastAPI(title="LTX-2.5 Multi-Modal Production Server (LoRA-Enabled)")
 
-print("⏳ Initializing Models into H100 80GB VRAM...")
+print("⏳ Initializing Models into VRAM...")
 
 MODEL_BASE = "models/ltx-2.5"
 model_paths = ModelPaths.from_split(
@@ -40,14 +40,11 @@ model_paths = ModelPaths.from_split(
 
 offload_choice = getattr(OffloadMode, "NONE", None)
 
-# Verified official repo distilled LoRA
 distilled_lora_list = []
 distilled_lora_path = f"{MODEL_BASE}/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
 if os.path.exists(distilled_lora_path):
-    print(f"✅ Loading Verified Distilled LoRA: {distilled_lora_path}")
+    print(f"✅ Loading Distilled LoRA: {distilled_lora_path}")
     distilled_lora_list.append(distilled_lora_path)
-else:
-    print(f"⚠️ Notice: LoRA not found at {distilled_lora_path}, running base weights.")
 
 pipe = A2VidPipelineTwoStage(
     model_paths=model_paths,
@@ -58,73 +55,58 @@ pipe = A2VidPipelineTwoStage(
     offload_mode=offload_choice,
 )
 
-print("🚀 Pipeline loaded with verified LoRA! API Server Ready on port 8000.")
+print("🚀 Pipeline loaded! API Server Ready on port 8000.")
 
 JOBS = {}
 gpu_lock = threading.Lock()
 
-def create_binding(cls, frame_index: int):
-    sig = inspect.signature(cls.__init__)
-    kwargs = {}
-    for p in sig.parameters:
-        if p in ("frame_index", "frame_idx", "frame", "target_frame", "index"):
-            kwargs[p] = frame_index
-    try:
-        return cls(**kwargs)
-    except Exception:
-        try:
-            return cls(frame_index)
-        except Exception:
-            return cls()
-
 def make_img_input(file_path: str, strength: float, binding_obj):
     """
-    Safely creates ImageConditioningInput ensuring attributes match what the pipeline expects.
+    Constructs ImageConditioningInput without keyword or argument position mismatch.
     """
-    # 1. Check exact __init__ parameters
     sig = inspect.signature(ImageConditioningInput.__init__)
     params = [p for p in sig.parameters.keys() if p != "self"]
     
+    # 1. Keyword mapping based on inspected parameter names
     kwargs = {}
     for p in params:
         if p in ("path", "image_path", "file_path", "img_path"):
-            kwargs[p] = file_path
+            kwargs[p] = str(file_path)
         elif p == "strength":
-            kwargs[p] = strength
+            kwargs[p] = float(strength)
         elif p in ("binding", "replace", "guide"):
             kwargs[p] = binding_obj
 
-    # Try instantiation with matched kwargs
-    if kwargs:
+    if len(kwargs) == len(params) and len(params) > 0:
         try:
-            obj = ImageConditioningInput(**kwargs)
-            # Ensure strength attribute exists
-            if not hasattr(obj, "strength"):
-                setattr(obj, "strength", strength)
-            if not hasattr(obj, "binding"):
-                setattr(obj, "binding", binding_obj)
-            return obj
+            return ImageConditioningInput(**kwargs)
         except Exception:
             pass
 
-    # Positional instantiation
+    # 2. Strict positional matching: (path, strength, binding)
     try:
-        obj = ImageConditioningInput(file_path, strength, binding_obj)
+        obj = ImageConditioningInput(str(file_path), float(strength), binding_obj)
         return obj
     except Exception:
-        try:
-            obj = ImageConditioningInput(binding_obj, strength, file_path)
-            return obj
-        except Exception:
-            obj = ImageConditioningInput(file_path)
-            setattr(obj, "strength", strength)
-            setattr(obj, "binding", binding_obj)
-            return obj
+        pass
+
+    # 3. Positional fallback: (binding, strength, path)
+    try:
+        obj = ImageConditioningInput(binding_obj, float(strength), str(file_path))
+        return obj
+    except Exception:
+        pass
+
+    # 4. Attribute fallback ensuring strength is float and not string
+    obj = ImageConditioningInput(str(file_path))
+    setattr(obj, "strength", float(strength))
+    setattr(obj, "binding", binding_obj)
+    return obj
 
 def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: list = None):
     """
-    Sirf Frame 0 ko base canvas banata hai.
-    Timeline par floating images replace nahi karta taaki video slideshow na bane.
+    Frame 0 canvas ko ImageReplace se lock karta hai.
+    Extra reference assets ko ImageGuide context provide karta hai.
     """
     conditioning_list = []
     
@@ -133,16 +115,28 @@ def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: lis
         start_canvas = ref_assets[0]
 
     if start_canvas and os.path.exists(start_canvas):
-        binding = create_binding(ImageReplace, frame_index=0)
-        conditioning_list.append(make_img_input(start_canvas, 1.0, binding))
+        try:
+            binding = ImageReplace(0)
+        except Exception:
+            binding = ImageReplace(frame_index=0)
+            
+        inp = make_img_input(start_canvas, 1.0, binding)
+        if hasattr(inp, "strength") and not isinstance(inp, str):
+            conditioning_list.append(inp)
 
-    # Reference assets ko context guiding ke taur par link karna
+    # Reference assets context guidance
     if ref_assets:
         for asset_path in ref_assets:
             if asset_path and os.path.exists(asset_path) and asset_path != start_canvas:
                 try:
-                    binding = create_binding(ImageGuide, frame_index=0)
-                    conditioning_list.append(make_img_input(asset_path, 0.70, binding))
+                    try:
+                        binding = ImageGuide(0)
+                    except Exception:
+                        binding = ImageGuide(frame_index=0)
+                    
+                    inp = make_img_input(asset_path, 0.70, binding)
+                    if hasattr(inp, "strength") and not isinstance(inp, str):
+                        conditioning_list.append(inp)
                 except Exception:
                     pass
                         
@@ -174,7 +168,6 @@ def render_worker(
             torch.cuda.empty_cache()
             JOBS[job_id]["status"] = "processing"
 
-            # Audio normalize
             cmd = [
                 "ffmpeg", "-y", "-i", raw_audio,
                 "-ac", "2", "-ar", "44100", stereo_audio
@@ -263,12 +256,12 @@ async def generate(
     negative_prompt: str = Form("worst quality, blurry, distorted, jitter, low resolution"),
     seed: int = Form(42),
     steps: int = Form(20),
-    height: int = Form(1088),
-    width: int = Form(1920),
+    height: int = Form(512),
+    width: int = Form(896),
     frame_rate: float = Form(24.0),
     duration: float = Form(5.0),
     cfg_scale: float = Form(3.0),
-    modality_scale: float = Form(0.65),
+    modality_scale: float = Form(0.60),
     output_path: str = Form(None)
 ):
     timestamp = int(time.time())
