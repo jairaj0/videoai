@@ -40,7 +40,7 @@ model_paths = ModelPaths.from_split(
 
 offload_choice = getattr(OffloadMode, "NONE", None)
 
-# Exact LoRA path verification matching repository scan
+# Verified official repo distilled LoRA
 distilled_lora_list = []
 distilled_lora_path = f"{MODEL_BASE}/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
 if os.path.exists(distilled_lora_path):
@@ -49,13 +49,11 @@ if os.path.exists(distilled_lora_path):
 else:
     print(f"⚠️ Notice: LoRA not found at {distilled_lora_path}, running base weights.")
 
-loras_list = []
-
 pipe = A2VidPipelineTwoStage(
     model_paths=model_paths,
     distilled_lora=distilled_lora_list,
     spatial_upsampler_path=f"{MODEL_BASE}/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
-    loras=loras_list,
+    loras=[],
     device=torch.device("cuda:0"),
     offload_mode=offload_choice,
 )
@@ -106,7 +104,7 @@ def make_img_input(file_path: str, strength: float, binding_obj):
 def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: list = None):
     """
     Sirf Frame 0 ko base canvas banata hai.
-    Timeline par random frames replace nahi karta taaki video slideshow na bane.
+    Timeline par floating images replace nahi karta taaki video slideshow na bane.
     """
     conditioning_list = []
     
@@ -118,6 +116,7 @@ def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: lis
         binding = create_binding(ImageReplace, frame_index=0)
         conditioning_list.append(make_img_input(start_canvas, 1.0, binding))
 
+    # Reference assets ko context guiding ke taur par link karna
     if ref_assets:
         for asset_path in ref_assets:
             if asset_path and os.path.exists(asset_path) and asset_path != start_canvas:
@@ -155,6 +154,7 @@ def render_worker(
             torch.cuda.empty_cache()
             JOBS[job_id]["status"] = "processing"
 
+            # Audio normalize
             cmd = [
                 "ffmpeg", "-y", "-i", raw_audio,
                 "-ac", "2", "-ar", "44100", stereo_audio

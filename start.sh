@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -e
 
 echo "=========================================="
 echo "⚡ Initializing LTX-2.5 Production Boot..."
@@ -27,7 +26,7 @@ fi
 # 3. Model Files & LoRAs Verification
 MODEL_DIR="LTX-2/models/ltx-2.5"
 TRANSFORMER_FILE="$MODEL_DIR/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
-LORA_FILE="$MODEL_DIR/loras/ltx-2.5-distilled-lora-bf16.safetensors"
+LORA_FILE="$MODEL_DIR/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors"
 DOWNLOAD_PID=""
 
 if [ -f "$TRANSFORMER_FILE" ] && [ -f "$LORA_FILE" ]; then
@@ -35,20 +34,41 @@ if [ -f "$TRANSFORMER_FILE" ] && [ -f "$LORA_FILE" ]; then
 else
   echo "📥 Models/LoRAs missing! Starting background download..."
   mkdir -p "$MODEL_DIR/loras"
+  mkdir -p "$MODEL_DIR/diffusion_models"
+  mkdir -p "$MODEL_DIR/text_encoders"
+  mkdir -p "$MODEL_DIR/vae"
+  mkdir -p "$MODEL_DIR/latent_upscale_models"
+  mkdir -p "$MODEL_DIR/model_patches"
+
   export HF_HUB_ENABLE_HF_TRANSFER=1
   pip install -q -U hf_transfer huggingface_hub
 
-  hf download Lightricks/LTX-2.5 \
-    diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors \
-    text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
-    vae/ltx-2.5-video-vae-bf16.safetensors \
-    vae/ltx-2.5-audio-vae-bf16.safetensors \
-    model_patches/ltx-2.5-duration-head-bf16.safetensors \
-    latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
-    loras/ltx-2.5-distilled-lora-bf16.safetensors \
-    loras/ltx-2.5-ic-lora-bf16.safetensors \
-    --token "$HF_TOKEN" \
-    --local-dir "$MODEL_DIR" &
+  # Verified official repo file structure
+  python3 -c "
+from huggingface_hub import hf_hub_download
+import os
+
+token = os.getenv('HF_TOKEN')
+repo = 'Lightricks/LTX-2.5'
+base = '$MODEL_DIR'
+
+files = [
+    'diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors',
+    'text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors',
+    'vae/ltx-2.5-video-vae-bf16.safetensors',
+    'vae/ltx-2.5-audio-vae-bf16.safetensors',
+    'model_patches/ltx-2.5-duration-head-bf16.safetensors',
+    'latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors',
+    'loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors'
+]
+
+for f in files:
+    target = os.path.join(base, f)
+    if not os.path.exists(target):
+        print(f'⏳ Downloading {f}...')
+        hf_hub_download(repo_id=repo, filename=f, local_dir=base, token=token)
+print('✅ All models and LoRAs verified!')
+" &
   DOWNLOAD_PID=$!
 fi
 
