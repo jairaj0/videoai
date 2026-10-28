@@ -26,7 +26,7 @@ from ltx_pipelines.utils.types import ImageConditioningInput, ImageReplace, Imag
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_core.model.video_vae import get_video_chunks_number
 
-app = FastAPI(title="LTX-2.5 Multi-Modal Production Server (Multi-Reference A2V)")
+app = FastAPI(title="LTX-2.5 Multi-Modal Production Server (LoRA-Enabled)")
 
 print("⏳ Initializing Models into H100 80GB VRAM...")
 
@@ -40,26 +40,37 @@ model_paths = ModelPaths.from_split(
 
 offload_choice = getattr(OffloadMode, "NONE", None)
 
+# LoRA discovery
+distilled_lora_list = []
+distilled_lora_path = f"{MODEL_BASE}/loras/ltx-2.5-distilled-lora-bf16.safetensors"
+if os.path.exists(distilled_lora_path):
+    print(f"✅ Loading Distilled LoRA: {distilled_lora_path}")
+    distilled_lora_list.append(distilled_lora_path)
+
+loras_list = []
+ic_lora_path = f"{MODEL_BASE}/loras/ltx-2.5-ic-lora-bf16.safetensors"
+if os.path.exists(ic_lora_path):
+    print(f"✅ Loading IC-LoRA for Reference Conditioning: {ic_lora_path}")
+    loras_list.append(ic_lora_path)
+
 pipe = A2VidPipelineTwoStage(
     model_paths=model_paths,
-    distilled_lora=[],
+    distilled_lora=distilled_lora_list,
     spatial_upsampler_path=f"{MODEL_BASE}/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
-    loras=[],
+    loras=loras_list,
     device=torch.device("cuda:0"),
     offload_mode=offload_choice,
 )
 
-print("🚀 Pipeline loaded! API Server Ready on port 8000.")
+print("🚀 Pipeline loaded with LoRAs! API Server Ready on port 8000.")
 
 JOBS = {}
 gpu_lock = threading.Lock()
 
 def create_binding(cls, frame_index: int):
-    """Safely instantiates ImageReplace or ImageGuide across different class signatures."""
     sig = inspect.signature(cls.__init__)
-    params = sig.parameters
     kwargs = {}
-    for p in params:
+    for p in sig.parameters:
         if p in ("frame_index", "frame_idx", "frame", "target_frame", "index"):
             kwargs[p] = frame_index
     try:
@@ -71,9 +82,6 @@ def create_binding(cls, frame_index: int):
             return cls()
 
 def make_img_input(file_path: str, strength: float, binding_obj):
-    """
-    Safely creates ImageConditioningInput without hardcoded keyword crashes.
-    """
     sig = inspect.signature(ImageConditioningInput.__init__)
     param_names = [p for p in sig.parameters.keys() if p != "self"]
     
@@ -92,7 +100,6 @@ def make_img_input(file_path: str, strength: float, binding_obj):
         except TypeError:
             pass
 
-    # Pure positional fallback
     try:
         return ImageConditioningInput(file_path, strength, binding_obj)
     except Exception:
@@ -100,27 +107,30 @@ def make_img_input(file_path: str, strength: float, binding_obj):
 
 def build_multi_asset_conditioning(first_frame_path: str = None, ref_assets: list = None):
     """
-    Frame 0 ke liye ImageReplace aur baki reference assets ke liye
-    causal latent attention boundaries par ImageGuide bind karta hai.
+    Sirf Frame 0 ko base canvas banata hai.
+    Timeline par random frames replace nahi karta taaki video slideshow na bane.
     """
     conditioning_list = []
     
-    # 1. First Frame Anchor (Canvas continuity / Scene starting frame)
-    if first_frame_path and os.path.exists(first_frame_path):
-        binding = create_binding(ImageReplace, frame_index=0)
-        conditioning_list.append(make_img_input(first_frame_path, 1.0, binding))
+    # 1. Starting Canvas / First Frame
+    start_canvas = first_frame_path
+    if not start_canvas and ref_assets and len(ref_assets) > 0:
+        start_canvas = ref_assets[0]
 
-    # 2. Multi-Reference Assets (Characters, Backgrounds, Props)
+    if start_canvas and os.path.exists(start_canvas):
+        binding = create_binding(ImageReplace, frame_index=0)
+        conditioning_list.append(make_img_input(start_canvas, 1.0, binding))
+
+    # 2. Reference Guidance (Agar IC-LoRA guide support ho toh weak guiding)
     if ref_assets:
         for idx, asset_path in enumerate(ref_assets):
-            if asset_path and os.path.exists(asset_path):
-                frame_slot = 1 + (8 * (idx + 1))
+            if asset_path and os.path.exists(asset_path) and asset_path != start_canvas:
                 try:
-                    binding = create_binding(ImageGuide, frame_index=frame_slot)
+                    # Guiding context without overwriting video pixels
+                    binding = create_binding(ImageGuide, frame_index=0)
+                    conditioning_list.append(make_img_input(asset_path, 0.70, binding))
                 except Exception:
-                    binding = create_binding(ImageReplace, frame_index=frame_slot)
-                
-                conditioning_list.append(make_img_input(asset_path, 0.85, binding))
+                    pass
                         
     return conditioning_list
 
@@ -150,20 +160,15 @@ def render_worker(
             torch.cuda.empty_cache()
             JOBS[job_id]["status"] = "processing"
 
-            # 1. Voice Audio conversion (44.1kHz Stereo standard)
             cmd = [
                 "ffmpeg", "-y", "-i", raw_audio,
                 "-ac", "2", "-ar", "44100", stereo_audio
             ]
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            # 2. Conditioning Inputs Build (First Frame + Multi Assets)
             images_list = build_multi_asset_conditioning(first_frame_img, ref_image_paths)
-
-            # 3. Audio & CFG Guider Parameters
             guider_params = MultiModalGuiderParams(cfg_scale=cfg_scale, modality_scale=modality_scale)
 
-            # 4. Pipeline Execution
             with torch.inference_mode():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     result = pipe(
@@ -197,7 +202,6 @@ def render_worker(
                     video_chunks_number=chunks_num,
                 )
 
-            # 5. Final Lossless Web-Ready Remux
             lossless_cmd = [
                 "ffmpeg", "-y", "-i", raw_video_tmp,
                 "-c:v", "libx264", "-crf", "16", "-preset", "fast",
@@ -230,7 +234,9 @@ def health():
         "device": torch.cuda.get_device_name(0),
         "vram_allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2),
         "vram_reserved_gb": round(torch.cuda.memory_reserved(0) / 1e9, 2),
-        "active_jobs": len(JOBS)
+        "active_jobs": len(JOBS),
+        "distilled_lora_loaded": len(distilled_lora_list) > 0,
+        "ic_lora_loaded": len(loras_list) > 0
     }
 
 @app.post("/generate")
@@ -254,12 +260,10 @@ async def generate(
     timestamp = int(time.time())
     job_id = f"render_{seed}_{timestamp}"
 
-    # 1. Save Voice Audio
     raw_audio = f"/tmp/raw_audio_{job_id}_{audio.filename}"
     with open(raw_audio, "wb") as buffer:
         shutil.copyfileobj(audio.file, buffer)
 
-    # 2. Save First Frame if provided
     first_frame_path = None
     if first_frame and first_frame.filename:
         ext = os.path.splitext(first_frame.filename)[1] or ".png"
@@ -267,7 +271,6 @@ async def generate(
         with open(first_frame_path, "wb") as buffer:
             shutil.copyfileobj(first_frame.file, buffer)
 
-    # 3. Save Multiple Reference Assets
     saved_ref_paths = []
     if ref_images:
         for idx, r_file in enumerate(ref_images):

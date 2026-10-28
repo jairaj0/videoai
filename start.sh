@@ -5,7 +5,7 @@ echo "=========================================="
 echo "⚡ Initializing LTX-2.5 Production Boot..."
 echo "=========================================="
 
-# 1. System packages check (Agar already installed hain toh apt skip karega)
+# 1. System packages check
 if ! command -v ffmpeg &> /dev/null || ! command -v tmux &> /dev/null; then
   echo "📦 Installing system packages (ffmpeg, tmux, aria2)..."
   export DEBIAN_FRONTEND=noninteractive
@@ -24,16 +24,17 @@ else
   echo "✅ LTX-2 directory already exists."
 fi
 
-# 3. Model Files Verification (Volume Check)
+# 3. Model Files & LoRAs Verification
 MODEL_DIR="LTX-2/models/ltx-2.5"
 TRANSFORMER_FILE="$MODEL_DIR/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+LORA_FILE="$MODEL_DIR/loras/ltx-2.5-distilled-lora-bf16.safetensors"
 DOWNLOAD_PID=""
 
-if [ -f "$TRANSFORMER_FILE" ]; then
-  echo "⚡ Models already exist in Volume! Skipping Hugging Face download."
+if [ -f "$TRANSFORMER_FILE" ] && [ -f "$LORA_FILE" ]; then
+  echo "⚡ Models & LoRAs already exist in Volume! Skipping Hugging Face download."
 else
-  echo "📥 Models missing! Starting background download..."
-  mkdir -p "$MODEL_DIR"
+  echo "📥 Models/LoRAs missing! Starting background download..."
+  mkdir -p "$MODEL_DIR/loras"
   export HF_HUB_ENABLE_HF_TRANSFER=1
   pip install -q -U hf_transfer huggingface_hub
 
@@ -44,6 +45,8 @@ else
     vae/ltx-2.5-audio-vae-bf16.safetensors \
     model_patches/ltx-2.5-duration-head-bf16.safetensors \
     latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+    loras/ltx-2.5-distilled-lora-bf16.safetensors \
+    loras/ltx-2.5-ic-lora-bf16.safetensors \
     --token "$HF_TOKEN" \
     --local-dir "$MODEL_DIR" &
   DOWNLOAD_PID=$!
@@ -63,7 +66,6 @@ fi
 # 6. Python Environment Setup
 cd LTX-2
 
-# Virtualenv check (Agar already configured hai toh sync instant bypass hoga)
 if [ ! -f ".venv/bin/uvicorn" ]; then
   echo "⚙️ Setting up virtual environment..."
   uv sync --compile-bytecode
@@ -74,7 +76,7 @@ fi
 
 # 7. Wait for models if downloading in background
 if [ -n "$DOWNLOAD_PID" ]; then
-  echo "⏳ Waiting for models download to finish..."
+  echo "⏳ Waiting for models and LoRA download to finish..."
   wait $DOWNLOAD_PID
 fi
 
